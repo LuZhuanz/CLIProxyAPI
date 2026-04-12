@@ -16,8 +16,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -273,11 +275,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		usagePublished := false
+		var translatedUsage usage.Detail
+		translatedUsageFound := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
+				usagePublished = true
 			}
 			if len(line) == 0 {
 				continue
@@ -291,6 +297,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// Pass through translator; it yields one or more chunks for the target schema.
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(line), &param)
 			for i := range chunks {
+				if detail, ok := parseUsageFromTranslatedStreamChunk(chunks[i]); ok {
+					translatedUsage = detail
+					translatedUsageFound = true
+				}
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
 		}
@@ -304,13 +314,47 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// response.completed events are still emitted exactly once.
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
 			for i := range chunks {
+				if detail, ok := parseUsageFromTranslatedStreamChunk(chunks[i]); ok {
+					translatedUsage = detail
+					translatedUsageFound = true
+				}
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
 		}
-		// Ensure we record the request if no usage chunk was ever seen
-		reporter.EnsurePublished(ctx)
+		if !usagePublished && translatedUsageFound {
+			reporter.Publish(ctx, translatedUsage)
+			usagePublished = true
+		}
+		if !usagePublished {
+			// Ensure we record the request only when no usage can be obtained.
+			reporter.EnsurePublished(ctx)
+		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func parseUsageFromTranslatedStreamChunk(chunk []byte) (usage.Detail, bool) {
+	if len(chunk) == 0 {
+		return usage.Detail{}, false
+	}
+	payload := bytes.TrimSpace(chunk)
+	if bytes.HasPrefix(payload, []byte("data:")) {
+		payload = bytes.TrimSpace(payload[5:])
+	}
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return usage.Detail{}, false
+	}
+	if detail, ok := helps.ParseCodexUsage(payload); ok {
+		return detail, true
+	}
+	if !gjson.GetBytes(payload, "usage").Exists() {
+		return usage.Detail{}, false
+	}
+	detail := helps.ParseOpenAIUsage(payload)
+	if detail.TotalTokens == 0 && detail.InputTokens == 0 && detail.OutputTokens == 0 && detail.CachedTokens == 0 && detail.ReasoningTokens == 0 {
+		return usage.Detail{}, false
+	}
+	return detail, true
 }
 
 func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
